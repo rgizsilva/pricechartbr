@@ -6,5 +6,5 @@ python-dotenv>=1.0.0
 pydantic>=2.7.0
 
 # Scraper
-playwright==1.44.0
+playwright>=1.47.0
 requests>=2.31.0
