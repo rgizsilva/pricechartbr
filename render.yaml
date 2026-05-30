@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: price-compass-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # você preenche manualmente no painel do Render
+    autoDeploy: true
