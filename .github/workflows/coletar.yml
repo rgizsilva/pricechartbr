@@ -1,0 +1,28 @@
+name: ML Coletar
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+jobs:
+  coletar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Rodar scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CHROME_PROFILE: /tmp/.chrome-ml
+        run: python ml_coletar.py

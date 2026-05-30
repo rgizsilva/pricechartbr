@@ -1,48 +1,116 @@
 """
 ml_coletar.py — Roda uma vez (ou via cron).
 
-O que mudou vs versão original:
-  - Sem PRODUTO hardcoded: lê os termos ativos da tabela search_queries.
-  - Sem watchlist.txt: salva em listings via upsert (não duplica).
-  - Registra ultima_busca em search_queries a cada execução.
+Usa Playwright (Chromium) para burlar o challenge Anubis do ML.
+Lê os termos ativos da tabela search_queries e salva em listings via upsert.
 
 Uso:
   python ml_coletar.py              # coleta todos os termos ativos
   python ml_coletar.py --termo "X"  # coleta só um termo (para testes)
+
+PRÉ-REQUISITOS:
+  pip install playwright
+  playwright install chromium
 """
 import argparse
 import re
 import json
 import time
 import random
+import os
 from datetime import datetime, timezone
 
-import requests
+from playwright.sync_api import sync_playwright
 
 from db import transaction
 
 # ── Configurações ─────────────────────────────────────────────
 TENTATIVAS_BUSCA = 5
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/147.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8"',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
-}
+
+# Perfil persistente — evita o challenge Anubis nas próximas execuções
+CHROME_PROFILE = os.environ.get(
+    "CHROME_PROFILE",
+    f"/home/{os.environ.get('USER', 'ubuntu')}/.chrome-ml"
+)
+CHROME_BIN = os.environ.get("CHROME_BIN", None)  # None = Chromium do Playwright
 
 
-# ── Parsing do HTML do ML ──────────────────────────────────────
-def parsear_results(html: str) -> list[dict]:
-    """Extrai anúncios da página de resultados do Mercado Livre."""
+# ── Parsing do HTML / initialState do ML ──────────────────────
+def extrair_initialstate(html: str) -> dict:
+    """Extrai o objeto initialState embutido no HTML da página de busca do ML."""
+    match = re.search(r'"initialState"\s*:\s*(\{)', html)
+    if not match:
+        return {}
+    start = match.start(1)
+    depth = 0
+    for i, c in enumerate(html[start:], start):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start:i + 1])
+                except Exception:
+                    return {}
+    return {}
+
+
+def parsear_results_polycard(html: str) -> list[dict]:
+    """
+    Parser principal: estrutura initialState.results[].polycard (ML 2026).
+    """
+    state = extrair_initialstate(html)
+    results = state.get("results", [])
+    parsed = []
+
+    for entry in results:
+        if entry.get("id") != "POLYCARD":
+            continue
+
+        poly = entry.get("polycard", {})
+        meta = poly.get("metadata", {})
+        item_id = meta.get("id", "")
+        if not item_id.startswith("MLB"):
+            continue
+
+        components = poly.get("components", [])
+
+        titulo = next(
+            (c["title"]["text"] for c in components
+             if c.get("type") == "title" and "title" in c),
+            "?"
+        )
+
+        preco = None
+        price_comp = next((c for c in components if c.get("type") == "price"), None)
+        if price_comp:
+            preco = price_comp.get("price", {}).get("current_price", {}).get("value")
+
+        condicao = next(
+            (c.get("item_condition", {}).get("text")
+             for c in components if c.get("type") == "item_condition"),
+            "?"
+        ) or "?"
+
+        url = "https://" + meta.get("url", "").lstrip("/")
+
+        parsed.append({
+            "mlb_id":        item_id,
+            "titulo":        titulo,
+            "preco_inicial": preco,
+            "condicao":      condicao,
+            "url":           url,
+            "status":        "active",
+        })
+
+    return parsed
+
+
+def parsear_results_legado(html: str) -> list[dict]:
+    """
+    Fallback: parser legado para estrutura antiga do ML (results[].type=ITEM).
+    """
     pos = html.find('"results":[{"id":"MLB')
     if pos == -1:
         return []
@@ -62,29 +130,24 @@ def parsear_results(html: str) -> list[dict]:
                 depth -= 1
                 if depth == 0:
                     try:
-                        d = json.loads(chunk[: j + 1])
+                        d = json.loads(chunk[:j + 1])
                         mlb_id = d["id"]
                         cond_attr = next(
-                            (
-                                a["value_name"]
-                                for a in d.get("attributes", [])
-                                if a["id"] == "ITEM_CONDITION"
-                            ),
+                            (a["value_name"] for a in d.get("attributes", [])
+                             if a["id"] == "ITEM_CONDITION"),
                             None,
                         )
-                        resultados.append(
-                            {
-                                "mlb_id": mlb_id,
-                                "titulo": d.get("title", "?"),
-                                "preco_inicial": d.get("price"),
-                                "condicao": cond_attr or d.get("condition", "?"),
-                                "url": (
-                                    f"https://produto.mercadolivre.com.br/"
-                                    f"{mlb_id.replace('MLB', 'MLB-')}"
-                                ),
-                                "status": "active",
-                            }
-                        )
+                        resultados.append({
+                            "mlb_id":        mlb_id,
+                            "titulo":        d.get("title", "?"),
+                            "preco_inicial": d.get("price"),
+                            "condicao":      cond_attr or d.get("condition", "?"),
+                            "url": (
+                                f"https://produto.mercadolivre.com.br/"
+                                f"{mlb_id.replace('MLB', 'MLB-')}"
+                            ),
+                            "status": "active",
+                        })
                     except Exception:
                         pass
                     break
@@ -92,51 +155,166 @@ def parsear_results(html: str) -> list[dict]:
     return resultados
 
 
+def parsear_html(html: str) -> list[dict]:
+    """Tenta o parser moderno; se retornar vazio, tenta o legado."""
+    itens = parsear_results_polycard(html)
+    if not itens:
+        itens = parsear_results_legado(html)
+    return itens
+
+
+# ── Captura com Playwright (trata challenge Anubis) ────────────
+def capturar_html(page, url: str) -> str | None:
+    """
+    Navega para a URL tratando o challenge Anubis do ML.
+    Retorna o HTML com initialState, ou None se falhar.
+    """
+    html_capturado = []
+
+    def handle_response(response):
+        url_sem_hash   = url.split("#")[0]
+        resp_sem_hash  = response.url.split("#")[0]
+        if (resp_sem_hash == url_sem_hash
+                and response.status == 200
+                and "text/html" in response.headers.get("content-type", "")):
+            try:
+                html_capturado.append(response.body().decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+
+    page.on("response", handle_response)
+    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+    # Aguarda challenge Anubis se aparecer
+    try:
+        if page.locator("#continue-button").count() > 0:
+            print("challenge, aguardando...", end=" ", flush=True)
+            page.wait_for_selector("#continue-button", state="hidden", timeout=20_000)
+            page.wait_for_load_state("networkidle", timeout=20_000)
+            print("ok.", end=" ", flush=True)
+    except Exception as e:
+        print(f"timeout challenge: {e}", end=" ", flush=True)
+
+    page.remove_listener("response", handle_response)
+
+    if "account-verification" in page.url:
+        print("bloqueado (account-verification)")
+        return None
+
+    # 1ª opção: HTML raw capturado da resposta HTTP
+    html = next((h for h in html_capturado if '"initialState"' in h), None)
+
+    # 2ª opção: DOM renderizado pelo JS
+    if not html:
+        dom = page.content()
+        if '"initialState"' in dom:
+            html = dom
+
+    # 3ª opção: evaluar initialState direto do JS da página
+    if not html:
+        try:
+            state_js = page.evaluate("""
+                () => {
+                    const scripts = Array.from(document.querySelectorAll('script'));
+                    for (const s of scripts) {
+                        if (s.textContent.includes('"initialState"')) return s.textContent;
+                    }
+                    if (window.__PRELOADED_STATE__) return JSON.stringify({initialState: window.__PRELOADED_STATE__});
+                    if (window.initialState)        return JSON.stringify({initialState: window.initialState});
+                    return null;
+                }
+            """)
+            if state_js and '"initialState"' in state_js:
+                html = state_js
+                print("[JS eval] ", end="", flush=True)
+        except Exception as e:
+            print(f"[JS eval falhou: {e}] ", end="", flush=True)
+
+    return html
+
+
 def buscar_termo(termo: str) -> list[dict]:
-    """Acumula resultados de TENTATIVAS_BUSCA buscas para o termo."""
+    """
+    Abre o Playwright, busca o termo no ML e retorna lista de anúncios.
+    Usa perfil persistente para não precisar resolver o challenge toda vez.
+    """
     slug = termo.lower().replace(" ", "-")
-    url = (
+    url  = (
         f"https://lista.mercadolivre.com.br/games/video-games/{slug}"
         "_NoIndex_True#applied_value_name%3DVideo+Games"
     )
-    vistos: set[str] = set()
-    acumulado: list[dict] = []
+    acumulado: dict[str, dict] = {}  # mlb_id → dados (deduplica)
 
-    for t in range(1, TENTATIVAS_BUSCA + 1):
-        print(f"  [Tentativa {t}/{TENTATIVAS_BUSCA}] ", end="", flush=True)
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-        except Exception as e:
-            print(f"Erro: {e}")
-            time.sleep(random.uniform(1, 2.5))
-            continue
-
-        if resp.status_code != 200:
-            print(f"HTTP {resp.status_code}")
-            time.sleep(random.uniform(1, 2.5))
-            continue
-
-        encontrados = parsear_results(resp.text)
-        novos = [i for i in encontrados if i["mlb_id"] not in vistos]
-        for item in novos:
-            vistos.add(item["mlb_id"])
-            acumulado.append(item)
-
-        print(
-            f"itens: {len(encontrados)} | novos: {len(novos)} | total: {len(acumulado)}"
+    with sync_playwright() as p:
+        launch_kwargs = dict(
+            user_data_dir=CHROME_PROFILE,
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--headless=new",
+                "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ],
+            locale="pt-BR",
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers={
+                "sec-ch-ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile":   "?0",
+                "sec-ch-ua-platform": '"Linux"',
+                "Accept-Language":    "pt-BR,pt;q=0.9",
+            },
         )
+        if CHROME_BIN:
+            launch_kwargs["executable_path"] = CHROME_BIN
 
-        if t < TENTATIVAS_BUSCA:
-            time.sleep(random.uniform(1, 2.5))
+        ctx = p.chromium.launch_persistent_context(**launch_kwargs)
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR','pt','en-US']});
+            window.chrome = { runtime: {} };
+        """)
+        page = ctx.new_page()
 
-    return acumulado
+        for t in range(1, TENTATIVAS_BUSCA + 1):
+            print(f"  [Tentativa {t}/{TENTATIVAS_BUSCA}] ", end="", flush=True)
+            try:
+                html = capturar_html(page, url)
+
+                if not html:
+                    print("sem initialState, pulando.")
+                else:
+                    encontrados = parsear_html(html)
+                    novos = sum(1 for i in encontrados if i["mlb_id"] not in acumulado)
+                    for item in encontrados:
+                        acumulado[item["mlb_id"]] = item
+                    print(
+                        f"itens: {len(encontrados)} | novos: {novos} | total: {len(acumulado)}"
+                    )
+                    if encontrados:
+                        break  # achou resultados, não precisa repetir
+
+            except Exception as e:
+                print(f"Erro: {e}")
+
+            if t < TENTATIVAS_BUSCA:
+                time.sleep(random.uniform(3, 6))
+
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+    return list(acumulado.values())
 
 
 # ── Persistência no banco ──────────────────────────────────────
 def upsert_listings(query_id: int, itens: list[dict]) -> int:
     """
-    Insere ou atualiza anúncios na tabela listings.
-    Não sobrescreve preco_final / finalizado_em / status de anúncios já fechados.
+    Insere ou atualiza anúncios em listings.
+    Não sobrescreve status/preco_final/finalizado_em de anúncios já fechados.
     Retorna quantos foram inseridos pela primeira vez.
     """
     novos = 0
@@ -151,16 +329,13 @@ def upsert_listings(query_id: int, itens: list[dict]) -> int:
                     (%(mlb_id)s, %(query_id)s, %(titulo)s, %(url)s, %(condicao)s,
                      'active', %(preco_inicial)s, NOW())
                 ON CONFLICT (mlb_id) DO UPDATE SET
-                    atualizado_em  = NOW(),
-                    titulo         = EXCLUDED.titulo,
-                    condicao       = EXCLUDED.condicao,
-                    preco_inicial  = COALESCE(listings.preco_inicial, EXCLUDED.preco_inicial)
-                    -- Não toca em status, preco_final, finalizado_em
+                    atualizado_em = NOW(),
+                    titulo        = EXCLUDED.titulo,
+                    condicao      = EXCLUDED.condicao,
+                    preco_inicial = COALESCE(listings.preco_inicial, EXCLUDED.preco_inicial)
                 """,
                 {**item, "query_id": query_id},
             )
-            # Conta novos (rowcount=1 após INSERT puro; psycopg2 não distingue
-            # INSERT de UPDATE no ON CONFLICT, então usamos a heurística abaixo)
             if cur.rowcount == 1:
                 novos += 1
 
@@ -174,8 +349,8 @@ def upsert_listings(query_id: int, itens: list[dict]) -> int:
 
 def carregar_queries_ativas(termo_override: str | None = None) -> list[dict]:
     """
-    Retorna lista de {id, termo} a processar.
-    Se termo_override for fornecido, cria/garante o termo no banco e retorna só ele.
+    Retorna {id, termo} dos termos a processar.
+    Se termo_override for fornecido, garante o termo no banco e retorna só ele.
     """
     with transaction() as cur:
         if termo_override:
@@ -197,16 +372,14 @@ def carregar_queries_ativas(termo_override: str | None = None) -> list[dict]:
 
 # ── Main ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Coleta anúncios do Mercado Livre.")
-    parser.add_argument(
-        "--termo", help="Força um termo específico (ignora search_queries)", default=None
-    )
+    parser = argparse.ArgumentParser(description="Coleta anúncios do ML → banco.")
+    parser.add_argument("--termo", default=None, help="Força um termo específico")
     args = parser.parse_args()
 
     queries = carregar_queries_ativas(args.termo)
 
     if not queries:
-        print("Nenhum termo ativo em search_queries. Adicione um registro e tente novamente.")
+        print("Nenhum termo ativo em search_queries.")
         raise SystemExit(0)
 
     for q in queries:
@@ -215,6 +388,13 @@ if __name__ == "__main__":
         print(f"{'='*55}")
 
         itens = buscar_termo(q["termo"])
-        novos = upsert_listings(q["id"], itens)
 
-        print(f"\n✅ Salvo no banco — total encontrados: {len(itens)} | novos: {novos}")
+        if not itens:
+            print("\n⚠️  Nenhum item encontrado. Possíveis causas:")
+            print("   - Challenge Anubis não resolveu (rode com headless=False uma vez)")
+            print("   - Estrutura do ML mudou (verifique parsear_results_polycard)")
+            print("   - IP bloqueado temporariamente")
+            continue
+
+        novos = upsert_listings(q["id"], itens)
+        print(f"\n✅ Salvo no banco — encontrados: {len(itens)} | novos: {novos}")
